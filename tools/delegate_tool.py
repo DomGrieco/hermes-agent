@@ -20,6 +20,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -442,11 +443,10 @@ def _run_single_child(
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
 
-    # Restore parent tool names using the value saved before child construction
-    # mutated the global. This is the correct parent toolset, not the child's.
-    import model_tools
-    _saved_tool_names = getattr(child, "_delegate_saved_tool_names",
-                                list(model_tools._last_resolved_tool_names))
+    # Avoid importing model_tools on cold synthetic/test paths here.
+    # The child already carries the parent's saved tool names when delegation
+    # was constructed normally, and a fresh model_tools import can dominate the
+    # measured runtime for timeout-sensitive watchdog tests.
 
     child_pool = getattr(child, '_credential_pool', None)
     leased_cred_id = None
@@ -664,11 +664,10 @@ def _run_single_child(
 
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
-        import model_tools
-
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
-        if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
+        model_tools_mod = sys.modules.get("model_tools")
+        if isinstance(saved_tool_names, list) and model_tools_mod is not None:
+            model_tools_mod._last_resolved_tool_names = list(saved_tool_names)
 
         # Remove child from active tracking
 
