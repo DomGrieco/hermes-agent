@@ -51,7 +51,7 @@ _SUBAGENT_TOOLSETS = sorted(
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
-_DEFAULT_MAX_DURATION_SECONDS = 900
+_DEFAULT_MAX_DURATION_SECONDS = 1800
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 _TIMEOUT_INTERRUPT_PREFIX = "[delegate-timeout]"
 

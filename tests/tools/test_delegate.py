@@ -75,7 +75,7 @@ class TestDelegateRequirements(unittest.TestCase):
 class TestDelegationDurationConfig(unittest.TestCase):
     def test_default_max_duration_seconds(self):
         with patch("tools.delegate_tool._load_config", return_value={}):
-            self.assertEqual(_get_max_duration_seconds(), 900.0)
+            self.assertEqual(_get_max_duration_seconds(), 1800.0)
 
     def test_zero_disables_max_duration(self):
         with patch("tools.delegate_tool._load_config", return_value={"max_duration_seconds": 0}):
