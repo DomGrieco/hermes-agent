@@ -87,6 +87,17 @@ def _get_max_duration_seconds() -> Optional[float]:
 
     Returns None when explicitly disabled with 0/negative values.
     """
+    env_val = os.getenv("DELEGATION_MAX_DURATION_SECONDS")
+    if env_val:
+        try:
+            seconds = float(env_val)
+            return seconds if seconds > 0 else None
+        except (TypeError, ValueError):
+            logger.warning(
+                "DELEGATION_MAX_DURATION_SECONDS=%r is not a valid number; falling back to config/default",
+                env_val,
+            )
+
     cfg = _load_config()
     val = cfg.get("max_duration_seconds")
     if val is not None:
@@ -99,13 +110,6 @@ def _get_max_duration_seconds() -> Optional[float]:
                 val,
                 _DEFAULT_MAX_DURATION_SECONDS,
             )
-    env_val = os.getenv("DELEGATION_MAX_DURATION_SECONDS")
-    if env_val:
-        try:
-            seconds = float(env_val)
-            return seconds if seconds > 0 else None
-        except (TypeError, ValueError):
-            pass
     return float(_DEFAULT_MAX_DURATION_SECONDS)
 
 DEFAULT_MAX_ITERATIONS = 50

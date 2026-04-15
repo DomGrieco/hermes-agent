@@ -81,6 +81,16 @@ class TestDelegationDurationConfig(unittest.TestCase):
         with patch("tools.delegate_tool._load_config", return_value={"max_duration_seconds": 0}):
             self.assertIsNone(_get_max_duration_seconds())
 
+    def test_env_override_takes_precedence_over_config(self):
+        with patch.dict(os.environ, {"DELEGATION_MAX_DURATION_SECONDS": "12"}, clear=False):
+            with patch("tools.delegate_tool._load_config", return_value={"max_duration_seconds": 34}):
+                self.assertEqual(_get_max_duration_seconds(), 12.0)
+
+    def test_env_override_can_disable_duration_even_when_config_is_set(self):
+        with patch.dict(os.environ, {"DELEGATION_MAX_DURATION_SECONDS": "0"}, clear=False):
+            with patch("tools.delegate_tool._load_config", return_value={"max_duration_seconds": 34}):
+                self.assertIsNone(_get_max_duration_seconds())
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
