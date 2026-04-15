@@ -530,6 +530,12 @@ def _run_single_child(
     try:
         result = child.run_conversation(user_message=goal)
 
+        # Stop the timeout watchdog before post-processing the result so a child
+        # that completed just under the wall-clock limit cannot be reclassified
+        # as timed out while we flush progress or inspect the returned payload.
+        _timeout_stop.set()
+        _timeout_thread.join(timeout=5)
+
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, '_flush'):
             try:
@@ -543,7 +549,10 @@ def _run_single_child(
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         interrupt_message = result.get("interrupt_message") or ""
-        timed_out = _timeout_triggered.is_set() or str(interrupt_message).startswith(_TIMEOUT_INTERRUPT_PREFIX)
+        timed_out = (
+            str(interrupt_message).startswith(_TIMEOUT_INTERRUPT_PREFIX)
+            or (_timeout_triggered.is_set() and interrupted and not completed)
+        )
         api_calls = result.get("api_calls", 0)
 
         if timed_out:

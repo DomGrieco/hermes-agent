@@ -303,6 +303,58 @@ class TestDelegateTask(unittest.TestCase):
         self.assertTrue(child._interrupt_requested)
         parent._touch_activity.assert_called()
 
+    def test_run_single_child_does_not_mark_completed_child_as_timeout_during_flush(self):
+        parent = _make_mock_parent(depth=0)
+
+        class FlushBarrier:
+            def _flush(self):
+                time.sleep(0.05)
+
+        class FastChild:
+            def __init__(self):
+                self.tool_progress_callback = FlushBarrier()
+                self._delegate_saved_tool_names = []
+                self._credential_pool = None
+                self.model = "test/model"
+                self.session_prompt_tokens = 0
+                self.session_completion_tokens = 0
+
+            def get_activity_summary(self):
+                return {
+                    "current_tool": None,
+                    "api_call_count": 1,
+                    "max_iterations": 20,
+                    "last_activity_desc": "completed",
+                }
+
+            def interrupt(self, message=None):
+                raise AssertionError("completed child should not be interrupted after return")
+
+            def run_conversation(self, user_message=None, **kwargs):
+                return {
+                    "final_response": "Finished successfully.",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                    "interrupted": False,
+                }
+
+            def close(self):
+                return None
+
+        child = FastChild()
+        with patch("tools.delegate_tool._get_max_duration_seconds", return_value=0.01):
+            result = _run_single_child(
+                task_index=0,
+                goal="Review this diff",
+                child=child,
+                parent_agent=parent,
+            )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["exit_reason"], "completed")
+        self.assertEqual(result["summary"], "Finished successfully.")
+        self.assertNotIn("error", result)
+
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://chatgpt.com/backend-api/codex"
