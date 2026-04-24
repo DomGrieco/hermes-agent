@@ -266,6 +266,34 @@ class TestSchemaConversion:
 
         assert schema["properties"]["items"]["items"]["properties"] == {}
 
+    def test_properties_named_argument_does_not_corrupt_properties_container(self):
+        """A property literally named 'properties' must remain a property schema.
+
+        FastMCP/mcp-atlassian exposes jira_get_issue(properties=...) as an
+        argument.  The normalizer must not treat the surrounding JSON Schema
+        properties map as a schema and inject a bogus string-valued
+        properties.type entry, which OpenAI/Codex rejects.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "issue_key": {"type": "string"},
+                "properties": {
+                    "description": "Optional comma-separated issue properties",
+                    "default": None,
+                    "type": "string",
+                },
+            },
+            "required": ["issue_key"],
+        })
+
+        assert schema["type"] == "object"
+        assert schema["properties"]["properties"]["type"] == "string"
+        assert schema["properties"]["issue_key"]["type"] == "string"
+        assert not isinstance(schema["properties"].get("type"), str)
+
     def test_convert_mcp_schema_survives_missing_inputschema_attribute(self):
         """A Tool object without .inputSchema must not crash registration."""
         import types

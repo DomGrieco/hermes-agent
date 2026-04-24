@@ -422,6 +422,33 @@ def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     assert response.output[0].content[0].text == "stream ok"
 
 
+def test_run_codex_stream_falls_back_to_create_when_stream_missing_created_before_delta(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(
+            final_error=RuntimeError("Expected to have received `response.created` before `response.output_text.delta`")
+        )
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback after missing created")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert calls["stream"] == 2
+    assert calls["create"] == 1
+    assert response.output[0].content[0].text == "create fallback after missing created"
+
+
 def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"stream": 0, "create": 0}
@@ -447,6 +474,108 @@ def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(mon
     assert calls["stream"] == 2
     assert calls["create"] == 1
     assert response.output[0].content[0].text == "create fallback ok"
+
+
+def test_run_codex_stream_fallback_synthesizes_terminal_response_from_delta_only(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(
+                type="response.output_text.delta",
+                delta="OK",
+                response={"id": "resp_123", "model": "frank/GLM-5.1"},
+            ),
+        ]
+    )
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(
+            final_error=RuntimeError("Expected to have received `response.created` before `response.output_text.delta`")
+        )
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert calls["stream"] == 2
+    assert calls["create"] == 1
+    assert create_stream.closed is True
+    assert response.output_text == "OK"
+    assert response.output[0].content[0].text == "OK"
+    assert response.model == "frank/GLM-5.1"
+
+
+def test_run_codex_stream_fallback_backfills_terminal_response_from_output_item_added(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="call_123",
+                    call_id="call_123",
+                    name="read_file",
+                    arguments="",
+                    status="in_progress",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                delta='{"path":"/etc/hosts"}',
+                output_index=0,
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(output=None, model="frank/GLM-5.1", status="completed"),
+            ),
+        ]
+    )
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(
+            final_error=RuntimeError("Expected to have received `response.created` before `response.output_item.added`")
+        )
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert calls["stream"] == 2
+    assert calls["create"] == 1
+    assert create_stream.closed is True
+    assert response.output[0].type == "function_call"
+    assert response.output[0].name == "read_file"
+    assert response.output[0].status == "completed"
+    assert response.output[0].arguments == '{"path":"/etc/hosts"}'
+
+    from agent.codex_responses_adapter import _normalize_codex_response
+    normalized, finish_reason = _normalize_codex_response(response)
+    assert finish_reason == "tool_calls"
+    assert normalized.tool_calls[0].function.name == "read_file"
+    assert normalized.tool_calls[0].function.arguments == '{"path":"/etc/hosts"}'
 
 
 def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):

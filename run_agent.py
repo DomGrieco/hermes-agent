@@ -740,6 +740,11 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
+        "[hermes-agent: tool call arguments were corrupted in this session and "
+        "have been dropped to keep the conversation alive. See issue #15236.]"
+    )
+
     @property
     def base_url(self) -> str:
         return self._base_url
@@ -5109,18 +5114,24 @@ class AIAgent:
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
-                if missing_completed and attempt < max_stream_retries:
+                missing_created = "response.created" in err_text and (
+                    "response.output_text.delta" in err_text or "response.output_item.added" in err_text
+                )
+                recoverable_stream_order = missing_completed or missing_created
+                if recoverable_stream_order and attempt < max_stream_retries:
                     logger.debug(
-                        "Responses stream closed before completion (attempt %s/%s); retrying. %s",
+                        "Responses stream emitted an incomplete/unsupported event sequence (attempt %s/%s); retrying. %s error=%s",
                         attempt + 1,
                         max_stream_retries + 1,
                         self._client_log_context(),
+                        err_text,
                     )
                     continue
-                if missing_completed:
+                if recoverable_stream_order:
                     logger.debug(
-                        "Responses stream did not emit response.completed; falling back to create(stream=True). %s",
+                        "Responses stream emitted an incomplete/unsupported event sequence; falling back to create(stream=True). %s error=%s",
                         self._client_log_context(),
+                        err_text,
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
@@ -5141,7 +5152,23 @@ class AIAgent:
 
         terminal_response = None
         collected_output_items: list = []
+        streamed_output_items: list = []
         collected_text_deltas: list = []
+        latest_response_meta = None
+
+        def _streamed_items_for_backfill(*, assume_completed: bool) -> list:
+            if not assume_completed:
+                return list(streamed_output_items)
+            completed_items = []
+            for item in streamed_output_items:
+                if getattr(item, "type", None) in {"function_call", "custom_tool_call", "message"}:
+                    status = getattr(item, "status", None)
+                    if status in {None, "queued", "in_progress", "incomplete"}:
+                        item = SimpleNamespace(**vars(item))
+                        item.status = "completed"
+                completed_items.append(item)
+            return completed_items
+
         try:
             for event in stream_or_response:
                 self._touch_activity("receiving stream response")
@@ -5149,13 +5176,45 @@ class AIAgent:
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
 
+                event_response = getattr(event, "response", None)
+                if event_response is None and isinstance(event, dict):
+                    event_response = event.get("response")
+                if event_response is not None:
+                    latest_response_meta = event_response
+
                 # Collect output items and text deltas for backfill
-                if event_type == "response.output_item.done":
+                if event_type == "response.output_item.added":
+                    added_item = getattr(event, "item", None)
+                    if added_item is None and isinstance(event, dict):
+                        added_item = event.get("item")
+                    if added_item is not None:
+                        streamed_output_items.append(SimpleNamespace(
+                            type=getattr(added_item, "type", None),
+                            id=getattr(added_item, "id", None),
+                            call_id=getattr(added_item, "call_id", None),
+                            name=getattr(added_item, "name", None),
+                            arguments=getattr(added_item, "arguments", "") or "",
+                            input=getattr(added_item, "input", "") or "",
+                            status=getattr(added_item, "status", None),
+                            content=getattr(added_item, "content", None),
+                            role=getattr(added_item, "role", None),
+                        ))
+                elif event_type == "response.output_item.done":
                     done_item = getattr(event, "item", None)
                     if done_item is None and isinstance(event, dict):
                         done_item = event.get("item")
                     if done_item is not None:
                         collected_output_items.append(done_item)
+                elif event_type == "response.function_call_arguments.delta":
+                    delta = getattr(event, "delta", "")
+                    if not delta and isinstance(event, dict):
+                        delta = event.get("delta", "")
+                    output_index = getattr(event, "output_index", None)
+                    if output_index is None and isinstance(event, dict):
+                        output_index = event.get("output_index")
+                    if delta and isinstance(output_index, int) and 0 <= output_index < len(streamed_output_items):
+                        prior = getattr(streamed_output_items[output_index], "arguments", "") or ""
+                        streamed_output_items[output_index].arguments = prior + delta
                 elif event_type in ("response.output_text.delta",):
                     delta = getattr(event, "delta", "")
                     if not delta and isinstance(event, dict):
@@ -5166,18 +5225,19 @@ class AIAgent:
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue
 
-                terminal_response = getattr(event, "response", None)
-                if terminal_response is None and isinstance(event, dict):
-                    terminal_response = event.get("response")
+                terminal_response = event_response
                 if terminal_response is not None:
-                    # Backfill empty output from collected stream events
+                    # Backfill empty or missing output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            terminal_response.output = list(collected_output_items)
+                    if not isinstance(_out, list) or not _out:
+                        backfill_items = collected_output_items or _streamed_items_for_backfill(
+                            assume_completed=event_type == "response.completed"
+                        )
+                        if backfill_items:
+                            terminal_response.output = list(backfill_items)
                             logger.debug(
                                 "Codex fallback stream: backfilled %d output items",
-                                len(collected_output_items),
+                                len(backfill_items),
                             )
                         elif collected_text_deltas:
                             assembled = "".join(collected_text_deltas)
@@ -5201,6 +5261,31 @@ class AIAgent:
 
         if terminal_response is not None:
             return terminal_response
+        if collected_output_items or streamed_output_items or collected_text_deltas:
+            assembled = "".join(collected_text_deltas)
+            synthesized_model = None
+            if isinstance(latest_response_meta, dict):
+                synthesized_model = latest_response_meta.get("model")
+            else:
+                synthesized_model = getattr(latest_response_meta, "model", None)
+            backfill_items = collected_output_items or _streamed_items_for_backfill(assume_completed=True)
+            synthesized_response = SimpleNamespace(
+                output=list(backfill_items) if backfill_items else [SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )],
+                output_text=assembled or None,
+                status="completed",
+                model=synthesized_model or api_kwargs.get("model"),
+            )
+            logger.debug(
+                "Codex fallback stream: synthesized terminal response without explicit completion event (items=%d, deltas=%d)",
+                len(collected_output_items),
+                len(collected_text_deltas),
+            )
+            return synthesized_response
         raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
@@ -7616,6 +7701,115 @@ class AIAgent:
         ]
         return api_msg
 
+    @staticmethod
+    def _sanitize_tool_call_arguments(
+        messages: list,
+        *,
+        logger=None,
+        session_id: str = None,
+    ) -> int:
+        """Repair corrupted assistant tool-call argument JSON in-place."""
+        log = logger or logging.getLogger(__name__)
+        if not isinstance(messages, list):
+            return 0
+
+        repaired = 0
+        marker = AIAgent._TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER
+
+        def _prepend_marker(tool_msg: dict) -> None:
+            existing = tool_msg.get("content")
+            if isinstance(existing, str):
+                if not existing:
+                    tool_msg["content"] = marker
+                elif not existing.startswith(marker):
+                    tool_msg["content"] = f"{marker}\n{existing}"
+                return
+            if existing is None:
+                tool_msg["content"] = marker
+                return
+            try:
+                existing_text = json.dumps(existing)
+            except TypeError:
+                existing_text = str(existing)
+            tool_msg["content"] = f"{marker}\n{existing_text}"
+
+        message_index = 0
+        while message_index < len(messages):
+            msg = messages[message_index]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                message_index += 1
+                continue
+
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                message_index += 1
+                continue
+
+            insert_at = message_index + 1
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+
+                arguments = function.get("arguments")
+                if arguments is None or arguments == "":
+                    function["arguments"] = "{}"
+                    continue
+                if isinstance(arguments, str) and not arguments.strip():
+                    function["arguments"] = "{}"
+                    continue
+                if not isinstance(arguments, str):
+                    continue
+
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError:
+                    tool_call_id = tool_call.get("id")
+                    function_name = function.get("name", "?")
+                    preview = arguments[:80]
+                    log.warning(
+                        "Corrupted tool_call arguments repaired before request "
+                        "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
+                        session_id or "-",
+                        message_index,
+                        tool_call_id or "-",
+                        function_name,
+                        preview,
+                    )
+                    function["arguments"] = "{}"
+
+                    existing_tool_msg = None
+                    scan_index = message_index + 1
+                    while scan_index < len(messages):
+                        candidate = messages[scan_index]
+                        if not isinstance(candidate, dict) or candidate.get("role") != "tool":
+                            break
+                        if candidate.get("tool_call_id") == tool_call_id:
+                            existing_tool_msg = candidate
+                            break
+                        scan_index += 1
+
+                    if existing_tool_msg is None:
+                        messages.insert(
+                            insert_at,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": marker,
+                            },
+                        )
+                        insert_at += 1
+                    else:
+                        _prepend_marker(existing_tool_msg)
+
+                    repaired += 1
+
+            message_index += 1
+
+        return repaired
+
     def _should_sanitize_tool_calls(self) -> bool:
         """Determine if tool_calls need sanitization for strict APIs.
 
@@ -9480,6 +9674,19 @@ class AIAgent:
             # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
             # However, providers like Moonshot AI require a separate 'reasoning_content' field
             # on assistant messages with tool_calls. We handle both cases here.
+            request_logger = getattr(self, "logger", None) or logging.getLogger(__name__)
+            repaired_tool_calls = self._sanitize_tool_call_arguments(
+                messages,
+                logger=request_logger,
+                session_id=self.session_id,
+            )
+            if repaired_tool_calls > 0:
+                request_logger.info(
+                    "Sanitized %s corrupted tool_call arguments before request (session=%s)",
+                    repaired_tool_calls,
+                    self.session_id or "-",
+                )
+
             api_messages = []
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()

@@ -2318,13 +2318,30 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
         return node
 
     def _repair_object_shape(node):
-        """Recursively repair object-shaped nodes: fill type, prune required."""
+        """Recursively repair object-shaped nodes: fill type, prune required.
+
+        JSON Schema's ``properties`` keyword is a map of property-name ->
+        schema, not itself a schema.  Treating that container like a schema
+        corrupts valid MCP schemas when a tool argument is literally named
+        ``properties`` (for example Jira's ``get_issue(properties=...)``): the
+        old generic recursion saw a ``properties`` key inside the container and
+        injected ``type: object`` as a bogus property schema string, which
+        OpenAI/Codex rejects.
+        """
         if isinstance(node, list):
             return [_repair_object_shape(item) for item in node]
         if not isinstance(node, dict):
             return node
 
-        repaired = {k: _repair_object_shape(v) for k, v in node.items()}
+        repaired = {}
+        for key, value in node.items():
+            if key in {"properties", "patternProperties", "$defs", "definitions"} and isinstance(value, dict):
+                repaired[key] = {
+                    prop_name: _repair_object_shape(prop_schema)
+                    for prop_name, prop_schema in value.items()
+                }
+            else:
+                repaired[key] = _repair_object_shape(value)
 
         # Coerce missing / null type when the shape is clearly an object
         # (has properties or required but no type).
