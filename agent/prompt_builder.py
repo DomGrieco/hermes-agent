@@ -1303,7 +1303,8 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "user": config.get("ssh_user", ""),
                 "port": config.get("ssh_port", 22),
                 "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
+                # Prompt probes are ephemeral and must never retain a shell.
+                "persistent": False,
             }
 
         container_config = None
@@ -1314,7 +1315,9 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
+                # A cache miss must not leave a sandbox behind or attach to a
+                # cross-process persistent Docker environment.
+                "container_persistent": False,
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
@@ -1323,8 +1326,8 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_shm_size": config.get("docker_shm_size", "1g"),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                "docker_shared_container_key": config.get("docker_shared_container_key", ""),
+                "docker_persist_across_processes": False,
+                "docker_shared_container_key": "",
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
             }
 
@@ -1360,13 +1363,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
     finally:
-        # The probe only needs a one-shot `uname`; without teardown the
-        # backend leaves a second idle sandbox (task_id="prompt-backend-probe")
-        # running for the whole process lifetime next to the agent's own one.
-        # ssh is left alone: it has no task-scoped sandbox and its cleanup()
-        # closes a ControlMaster socket (keyed by user@host:port) shared with
-        # the agent's real environment; ControlPersist expires it anyway.
-        if env is not None and env_type != "ssh":
+        if env is not None:
             try:
                 from tools.terminal_tool import _cleanup_env
 

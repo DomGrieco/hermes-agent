@@ -799,6 +799,7 @@ class TestEnvironmentHints:
 
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         _pb._clear_backend_probe_cache()
+        cleaned = []
 
         class _FakeEnv:
             def execute(self, cmd, timeout=None):
@@ -810,10 +811,14 @@ class TestEnvironmentHints:
                     ),
                 }
 
+            def cleanup(self):
+                cleaned.append(True)
+
         created = {}
 
         def _fake_create_environment(*, env_type, **kwargs):
             created["env_type"] = env_type
+            created.update(kwargs)
             return _FakeEnv()
 
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
@@ -826,6 +831,9 @@ class TestEnvironmentHints:
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
+        assert cleaned == [True]
+        assert created["container_config"]["container_persistent"] is False
+        assert created["container_config"]["docker_persist_across_processes"] is False
 
     def test_probe_remote_backend_tears_down_its_sandbox(self, monkeypatch):
         """THE BUG: the probe leaked a second, permanently idle sandbox.
@@ -917,18 +925,17 @@ class TestEnvironmentHints:
         assert _pb._probe_remote_backend("singularity") is not None
         assert calls == ["bare"]
 
-    def test_probe_remote_backend_does_not_tear_down_ssh(self, monkeypatch):
-        """SSH has no task-scoped sandbox: its cleanup() closes a ControlMaster
-        socket shared with the agent's real environment, so the probe must
-        leave it alone (nothing leaks — ControlPersist expires the master)."""
+    def test_probe_remote_backend_tears_down_ephemeral_ssh(self, monkeypatch):
+        """The probe disables persistent SSH before closing its own connection."""
         import agent.prompt_builder as _pb
 
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         _pb._clear_backend_probe_cache()
 
         calls = []
+        created = {}
 
-        class _SharedSshEnv:
+        class _EphemeralSshEnv:
             def execute(self, cmd, timeout=None):
                 return {
                     "returncode": 0,
@@ -941,11 +948,16 @@ class TestEnvironmentHints:
             def cleanup(self):
                 calls.append("cleanup")
 
+        def create_environment(**kwargs):
+            created.update(kwargs)
+            return _EphemeralSshEnv()
+
         import tools.terminal_tool as _tt
-        monkeypatch.setattr(_tt, "_create_environment", lambda **kw: _SharedSshEnv())
+        monkeypatch.setattr(_tt, "_create_environment", create_environment)
 
         assert _pb._probe_remote_backend("ssh") is not None
-        assert calls == []
+        assert calls == ["cleanup"]
+        assert created["ssh_config"]["persistent"] is False
 
     def test_remote_probe_cache_is_scoped_by_profile_and_ssh_settings(
         self,
