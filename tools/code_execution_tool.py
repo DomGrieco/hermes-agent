@@ -437,7 +437,7 @@ _TOOL_STUBS = {
     "tool_search": (
         "tool_search",
         "queries: list, limit: int = 5",
-        '"""Search deferred MCP and plugin tools. Returns a dict with matching tool metadata."""',
+        '"""Search deferred MCP and plugin tools for one or more queries."""',
         '{"queries": queries, "limit": limit}',
     ),
     "tool_describe": (
