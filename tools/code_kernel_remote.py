@@ -349,6 +349,9 @@ def execute_in_remote_kernel(
     timeout: int,
     max_tool_calls: int,
     reset: bool,
+    session_id: str = "",
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
     idle_exit: int = 1800,
 ) -> Optional[Dict[str, Any]]:
     """Run one cell in the owner's remote kernel.
@@ -465,6 +468,7 @@ def _run_remote_cell(
             env, f"{kernel.kernel_dir}/rpc", task_env_id,
             tool_call_log, tool_call_counter, max_tool_calls,
             sandbox_tools, stop_event, kernel.rpc_token,
+            session_id, enabled_toolsets, disabled_toolsets,
         ),
         daemon=True,
     )
