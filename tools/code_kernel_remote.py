@@ -44,8 +44,9 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # One lock guards the registry; teardown runs outside it (mirrors code_kernel).
-_REMOTE_KERNELS: Dict[Tuple, "RemoteKernel"] = {}
+_REMOTE_KERNELS: Dict[Tuple[Any, ...], "RemoteKernel"] = {}
 _REMOTE_KERNELS_LOCK = threading.Lock()
+_REMOTE_KERNEL_CREATE_LOCK = threading.Lock()
 
 # How often the host polls the remote for a cell result file. Each poll is
 # one env.execute round-trip (typically 0.1-0.4s on ssh/docker), so this is
@@ -160,6 +161,7 @@ class RemoteKernel:
     # kernels: killing one mid-cell tears the runner out from under a live
     # poll loop (same guard as tools.code_kernel, hermes-agent#101861).
     attached: int = 0
+    lock: Any = field(default_factory=threading.RLock, repr=False)
 
 
 def _kernel_key(
@@ -200,23 +202,30 @@ def _is_alive(kernel: RemoteKernel) -> bool:
 
 def _kill(kernel: RemoteKernel) -> None:
     """Best-effort kill of the runner and its subprocesses, then rm -rf."""
-    try:
-        kernel.env.execute(
-            # Kill the runner's process group if the shell gave it one,
-            # falling back to the single PID.
-            f"pkill -TERM -P {shlex.quote(kernel.pid)} 2>/dev/null; "
-            f"kill {shlex.quote(kernel.pid)} 2>/dev/null; true",
-            cwd="/", timeout=15,
-        )
-    except Exception:
-        logger.debug("remote kernel kill failed (transport?)", exc_info=True)
-    try:
-        kernel.env.execute(
-            f"rm -rf {shlex.quote(kernel.kernel_dir)}", cwd="/", timeout=15,
-        )
-    except Exception:
-        logger.debug("remote kernel dir cleanup failed", exc_info=True)
+    with kernel.lock:
+        try:
+            kernel.env.execute(
+                # Kill the runner's process group if the shell gave it one,
+                # falling back to the single PID.
+                f"pkill -TERM -P {shlex.quote(kernel.pid)} 2>/dev/null; "
+                f"kill {shlex.quote(kernel.pid)} 2>/dev/null; true",
+                cwd="/", timeout=15,
+            )
+        except Exception:
+            logger.debug("remote kernel kill failed (transport?)", exc_info=True)
+        try:
+            kernel.env.execute(
+                f"rm -rf {shlex.quote(kernel.kernel_dir)}", cwd="/", timeout=15,
+            )
+        except Exception:
+            logger.debug("remote kernel dir cleanup failed", exc_info=True)
 
+
+def _kernel_busy(kernel: RemoteKernel) -> bool:
+    acquired = kernel.lock.acquire(blocking=False)
+    if acquired:
+        kernel.lock.release()
+    return not acquired
 
 
 def shutdown_all_remote_kernels() -> None:
@@ -415,18 +424,32 @@ def execute_in_remote_kernel(
 
     reused = kernel is not None
     if kernel is None:
-        kernel = _spawn_remote_kernel(
-            env, env_type, owner, task_env_id, sandbox_tools,
-            idle_exit=idle_exit,
-        )
-        if kernel is None:
-            return None  # fail open to per-call
-        with _REMOTE_KERNELS_LOCK:
-            _REMOTE_KERNELS[key] = kernel
-            evicted = _evict_over_cap_unlocked(keep=key)
-        for doomed in evicted:
-            _kill(doomed)
+        with _REMOTE_KERNEL_CREATE_LOCK:
+            # Another caller may have published this key while we waited.
+            with _REMOTE_KERNELS_LOCK:
+                kernel = _REMOTE_KERNELS.get(key)
+            if kernel is not None and not _is_alive(kernel):
+                with _REMOTE_KERNELS_LOCK:
+                    _REMOTE_KERNELS.pop(key, None)
+                _kill(kernel)
+                kernel = None
+                state_lost = True
+            if kernel is None:
+                kernel = _spawn_remote_kernel(
+                    env, env_type, owner, task_env_id, sandbox_tools,
+                    idle_exit=idle_exit,
+                )
+                if kernel is None:
+                    return None  # fail open to per-call
+                with _REMOTE_KERNELS_LOCK:
+                    _REMOTE_KERNELS[key] = kernel
+                    evicted = _evict_over_cap_unlocked(keep=key)
+                for doomed in evicted:
+                    _kill(doomed)
+            else:
+                reused = True
 
+    kernel.lock.acquire()
     kernel.last_used = time.monotonic()
     with _REMOTE_KERNELS_LOCK:
         kernel.attached += 1
@@ -439,11 +462,15 @@ def execute_in_remote_kernel(
             sandbox_tools=sandbox_tools, timeout=timeout,
             max_tool_calls=max_tool_calls, reused=reused,
             state_reset=state_reset, state_lost=state_lost,
+            session_id=session_id,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
         )
     finally:
         with _REMOTE_KERNELS_LOCK:
             kernel.attached -= 1
             kernel.last_used = time.monotonic()
+        kernel.lock.release()
 
 
 def _run_remote_cell(
@@ -459,6 +486,9 @@ def _run_remote_cell(
     reused: bool,
     state_reset: bool,
     state_lost: bool,
+    session_id: str,
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
 ) -> Dict[str, Any]:
     from tools.code_execution_tool import (
         _rpc_poll_loop,
@@ -542,13 +572,14 @@ def _run_remote_cell(
     finally:
         stop_event.set()
         rpc_thread.join(timeout=5)
+        if cell_status in ("timeout", "protocol-error", "no-result", "exit"):
+            with _REMOTE_KERNELS_LOCK:
+                _REMOTE_KERNELS.pop(key, None)
+            _kill(kernel)
 
     if cell_status in ("timeout", "protocol-error", "no-result"):
         # No safe way to interrupt one cell in place (same contract as
         # local): kill the kernel, report the loss, respawn next call.
-        with _REMOTE_KERNELS_LOCK:
-            _REMOTE_KERNELS.pop(key, None)
-        _kill(kernel)
         return {
             "status": "timeout" if cell_status == "timeout" else "error",
             "stdout": "",
@@ -568,11 +599,6 @@ def _run_remote_cell(
                 ),
             },
         }
-
-    if cell_status == "exit":
-        with _REMOTE_KERNELS_LOCK:
-            _REMOTE_KERNELS.pop(key, None)
-        _kill(kernel)
 
     kernel.execution_count = int(cell_payload.get("execution_count", 0) or 0)
 
