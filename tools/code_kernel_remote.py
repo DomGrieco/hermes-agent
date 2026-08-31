@@ -162,10 +162,23 @@ class RemoteKernel:
     attached: int = 0
 
 
-def _kernel_key(owner: str, env_type: str, task_env_id: str) -> Tuple:
+def _kernel_key(
+    owner: str,
+    env_type: str,
+    env: Any,
+    sandbox_tools: frozenset,
+) -> Tuple:
+    """Return the stable session and environment identity for kernel reuse."""
     from tools.code_kernel import _profile_scope
 
-    return (owner, _profile_scope(), "remote", env_type, task_env_id)
+    return (
+        owner,
+        _profile_scope(),
+        "remote",
+        env_type,
+        id(env),
+        tuple(sorted(sandbox_tools)),
+    )
 
 
 def _is_alive(kernel: RemoteKernel) -> bool:
@@ -203,6 +216,7 @@ def _kill(kernel: RemoteKernel) -> None:
         )
     except Exception:
         logger.debug("remote kernel dir cleanup failed", exc_info=True)
+
 
 
 def shutdown_all_remote_kernels() -> None:
@@ -373,7 +387,7 @@ def execute_in_remote_kernel(
     from tools.code_kernel import _resolve_owner
 
     owner = _resolve_owner(task_env_id)
-    key = _kernel_key(owner, env_type, task_env_id)
+    key = _kernel_key(owner, env_type, env, sandbox_tools)
     state_lost = False
     state_reset = False
 
@@ -409,6 +423,9 @@ def execute_in_remote_kernel(
             return None  # fail open to per-call
         with _REMOTE_KERNELS_LOCK:
             _REMOTE_KERNELS[key] = kernel
+            evicted = _evict_over_cap_unlocked(keep=key)
+        for doomed in evicted:
+            _kill(doomed)
 
     kernel.last_used = time.monotonic()
     with _REMOTE_KERNELS_LOCK:
