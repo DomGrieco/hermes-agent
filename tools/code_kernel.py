@@ -896,6 +896,9 @@ def execute_in_session_kernel(
             child_cwd=child_cwd, sandbox_tools=sandbox_tools, timeout=timeout,
             max_tool_calls=max_tool_calls, is_interrupted=is_interrupted,
             exec_start=exec_start, state_reset=state_reset,
+            session_id=session_id,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
         )
     finally:
         with _KERNELS_LOCK:
@@ -922,6 +925,9 @@ def _run_cell(
     is_interrupted,
     exec_start: float,
     state_reset: bool,
+    session_id: str,
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
 ) -> str:
     from tools.code_execution_tool import (
         _sandbox_failure_hint,
